@@ -35,7 +35,8 @@ namespace sglang {
  * zero-size tensors, flagged by `have_attn_sink` and `have_topk_length`.
  *
  * \param q                  [s_q, h_q, 576] e4m3, last dim contiguous
- * \param kv                 [s_kv, 576] e4m3 token rows, last dim contiguous
+ * \param kv4                [s_kv, 256] uint8 packed e2m1 of the 512 NoPE dims
+ * \param kv4_rope           [s_kv, 80] uint8 pre-scaled e4m3 RoPE + this row's ue8m0 exponent
  * \param indices            [s_q, topk] int32 rows of `kv`; entries < 0 or >= s_kv are masked
  * \param attn_sink          [h_q] float32, or empty
  * \param topk_length        [s_q] int32, or empty
@@ -50,7 +51,9 @@ namespace sglang {
  */
 void sparse_mla_q8kv8_sm100_dispatch(
     tvm::ffi::TensorView q,
-    tvm::ffi::TensorView kv,
+    tvm::ffi::TensorView kv4,
+    tvm::ffi::TensorView kv4_rope,
+    tvm::ffi::TensorView kv4_sf,
     tvm::ffi::TensorView indices,
     tvm::ffi::TensorView attn_sink,
     tvm::ffi::TensorView topk_length,
@@ -67,10 +70,10 @@ void sparse_mla_q8kv8_sm100_dispatch(
     int64_t num_splits,
     int64_t stride_q_s_q,
     int64_t stride_q_h_q,
-    int64_t stride_kv_s_kv,
     int64_t stride_indices_s_q,
     double bmm1_scale,
     double bmm2_scale,
+    double pt_eL,
     int64_t have_attn_sink,
     int64_t have_topk_length) {
   using q8kv8_sm100::run_sparse_mla_q8kv8_sm100;
@@ -84,16 +87,18 @@ void sparse_mla_q8kv8_sm100_dispatch(
   p.split_len = static_cast<int32_t>(topk / num_splits);
   p.scale_log2 = static_cast<float>(bmm1_scale * M_LOG2E);
   p.bmm2_scale = static_cast<float>(bmm2_scale);
+  p.pt_eL = static_cast<float>(pt_eL);
 
   p.q = static_cast<const uint8_t*>(q.data_ptr());
-  p.kv = static_cast<const uint8_t*>(kv.data_ptr());
+  p.kv4 = static_cast<const uint8_t*>(kv4.data_ptr());
+  p.kv4_sf = static_cast<const uint8_t*>(kv4_sf.data_ptr());  // PT step 2: dense r_t (e4m3) per row
+  p.kv4_rope = static_cast<const uint8_t*>(kv4_rope.data_ptr());
   p.indices = static_cast<const int32_t*>(indices.data_ptr());
   p.attn_sink = have_attn_sink ? static_cast<const float*>(attn_sink.data_ptr()) : nullptr;
   p.topk_length = have_topk_length ? static_cast<const int32_t*>(topk_length.data_ptr()) : nullptr;
 
   p.stride_q_s_q = stride_q_s_q;
   p.stride_q_h_q = stride_q_h_q;
-  p.stride_kv_s_kv = stride_kv_s_kv;
   p.stride_indices_s_q = stride_indices_s_q;
 
   if (num_splits > 1) {

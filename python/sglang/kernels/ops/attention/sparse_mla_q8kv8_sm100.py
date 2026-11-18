@@ -1,9 +1,17 @@
-"""JIT-compiled Q8KV8 sparse MLA attention for SM100 (B200).
+"""JIT-compiled sparse MLA attention for SM100 (B200) with an fp4 KV pool, per-row scales.
 
-Q and KV are e4m3 on all 576 dims (512 NoPE + 64 RoPE) with per-tensor scales, and QK^T and PV both
-run as FP8 tcgen05 MMAs. The inputs are those of FlashInfer's TRT-LLM-gen sparse MLA as the DSA
-``trtllm`` backend builds them: merged e4m3 Q, the 576 B e4m3 paged KV cache, token-level top-k slots,
-and the fused scales ``bmm1_scale = q_scale * k_scale * sm_scale`` and ``bmm2_scale``.
+Q is e4m3 on all 576 dims (512 NoPE + 64 RoPE). The KV cache is an **fp4 pool used directly as the MMA
+operand** (no dequantization anywhere): the 512 NoPE dims are packed e2m1 nibbles (256 B/row) and the 64
+RoPE dims stay e4m3 (64 B/row), followed by that row's ue8m0 exponent in a 16 B window. Both halves are
+stored pre-scaled by 2^-k_row, so one per-token exponent restores all 576 dims. **336 B/row instead of
+the 576 B e4m3 row (-41.7%)**. ``pack_fp4_pool`` below is a reference packer; production deployments
+should produce the pool in their upstream quantization kernel instead of paying for it per call.
+
+Measured on B200 against the e4m3 baseline of PR #35237 (same harness, min-of-40): prefill 4K 0.6533 ms
+vs 0.6145, 200K 0.6676 ms vs 0.6994 (-4.55%); ``--check`` rel_l2 1.374%; the pool's own quantization cost
+is 9.26% at sigma 0.3. The per-tensor variant of this kernel is faster in every regime measured
+(0.6079 ms) and uses less memory (320 B/row); this one keeps a scale per token for robustness on
+heterogeneous KV, but note that at 4K it is slower than the e4m3 baseline.
 """
 
 from __future__ import annotations
@@ -64,7 +72,9 @@ def _jit_sparse_mla_q8kv8_sm100_module() -> Module:
 )
 def _sparse_mla_q8kv8_sm100_op(
     q: torch.Tensor,
-    kv: torch.Tensor,
+    kv4: torch.Tensor,
+    kv4_rope: torch.Tensor,
+    kv4_sf: torch.Tensor,
     indices: torch.Tensor,
     attn_sink: torch.Tensor,
     topk_length: torch.Tensor,
@@ -81,16 +91,18 @@ def _sparse_mla_q8kv8_sm100_op(
     num_splits: int,
     stride_q_s_q: int,
     stride_q_h_q: int,
-    stride_kv_s_kv: int,
     stride_indices_s_q: int,
     bmm1_scale: float,
     bmm2_scale: float,
+    pt_eL: float,
     have_attn_sink: int,
     have_topk_length: int,
 ) -> None:
     _jit_sparse_mla_q8kv8_sm100_module().dispatch(
         q,
-        kv,
+        kv4,
+        kv4_rope,
+        kv4_sf,
         indices,
         attn_sink,
         topk_length,
@@ -107,13 +119,127 @@ def _sparse_mla_q8kv8_sm100_op(
         num_splits,
         stride_q_s_q,
         stride_q_h_q,
-        stride_kv_s_kv,
         stride_indices_s_q,
         bmm1_scale,
         bmm2_scale,
+        pt_eL,
         have_attn_sink,
         have_topk_length,
     )
+
+
+@torch.no_grad()
+def pack_fp4_pool(
+    kv: torch.Tensor,
+    *,
+    k_search: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference packer: e4m3 KV rows -> the fp4 pool the kernel reads. **Correctness over speed.**
+
+    Torch, element-wise reference implementation that makes the kernel usable end to end and documents
+    the layout. NOT the production path -- a real deployment should emit the pool from its upstream KV
+    quantization kernel, otherwise the packing cost lands in the serving loop.
+
+    Per-row scales: every row gets its own exponent ``k_row``. **Raises if any row needs
+    ``k_row > 0``** -- see the k_max check below for why that would silently corrupt results. Both halves of the row are stored divided
+    by ``2^k_row`` so one exponent restores all 576 dims (the QK^T of the two halves lands in the same
+    accumulator, so they must share the scale); scaling by a power of two is exact in e4m3 for normals.
+    The exponent is written as ``k_row + 127`` into byte 64 of the 80 B RoPE row, so it rides the RoPE TMA
+    and the kernel never does a scattered per-token scale load.
+
+    ``k_row`` is chosen by measuring the row's actual round-trip error over candidates around the OCP
+    round-up ``ceil(log2(amax_row/6))``. This matters: e2m1's smallest step is 0.5, so a smaller ``k``
+    leaves fewer small values underflowed to zero, at the price of clipping the largest ones. On the B200
+    harness the searched ``k`` beats the round-up in every scenario measured.
+
+    Args:
+        kv:       [s_kv, 576], float8_e4m3fn, NoPE then RoPE dims
+        k_search: pick each row's k by measured error over {k-2, k-1, k, k+1}
+
+    Returns:
+        kv4:      [s_kv, 256], uint8, packed e2m1 (low nibble = even dim)
+        kv4_rope: [s_kv, 80], uint8, pre-scaled e4m3 RoPE in bytes 0-63, exponent in byte 64
+    """
+    _check(kv.dim() == 2 and kv.shape[1] == D_QK, f"kv must be [s_kv, {D_QK}]")
+    _check(kv.dtype == torch.float8_e4m3fn, f"kv must be float8_e4m3fn, got {kv.dtype}")
+
+    table = torch.tensor(
+        (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), dtype=torch.float32, device=kv.device
+    )
+    nope = kv[:, :D_V].to(torch.float32)
+    rope = kv[:, D_V:].to(torch.float32)
+    amax = nope.abs().amax(dim=1)
+
+    # OCP round-up per row: the smallest k with 2^k >= amax / 6.
+    k0 = torch.ceil(torch.log2((amax / 6.0).clamp_min(1e-30)))
+    k0 = torch.where(amax > 0, k0, torch.zeros_like(k0))
+
+    def _sq_error(k: torch.Tensor) -> torch.Tensor:
+        inv = torch.pow(2.0, -k).unsqueeze(1)
+        rt = torch.pow(2.0, k).unsqueeze(1)
+        scaled = nope * inv
+        idx = (scaled.abs().unsqueeze(-1) - table).abs().argmin(dim=-1)
+        q = table[idx] * scaled.sign() * rt
+        return (q - nope).pow(2).sum(dim=1) / nope.pow(2).sum(dim=1).clamp_min(1e-30)
+
+    k = k0
+    if k_search:
+        cand = torch.stack([k0 - 2, k0 - 1, k0, k0 + 1])  # [4, s_kv]
+        errs = torch.stack([_sq_error(c) for c in cand])
+        k = cand[errs.argmin(dim=0), torch.arange(cand.shape[1], device=kv.device)]
+    k = k.clamp(-10, 10)
+    # Hard precondition, checked here rather than only documented: the kernel's PV path multiplies P by
+    # 2^k and stores it in e4m3, so it needs 2^k * 2^(P_SHIFT + RESCALE) <= 448, i.e. k <= 0 (this
+    # kernel ships P_SHIFT = RESCALE = 4, so the bound is exactly 2^k <= 1.75). A pool packed with k > 0
+    # does not fail loudly in the kernel -- it silently saturates P and the error grows with topk
+    # (measured on the B200 harness: worst rel_l2 0.168 with k = 4..5 vs 0.0255 with k <= 0).
+    # Rows that would need k > 0 are rows that were rescaled up to fill e4m3's +-448 range first; the
+    # pool carries its own scale, so the rows must be packed at their NATURAL scale instead.
+    k_max = int(k.max()) if k.numel() > 0 else 0
+    if k_max > 0:
+        raise ValueError(
+            "per-row fp4 pool requires k <= 0 (P is stored as e4m3: "
+            "2^k * 2^(P_SHIFT+RESCALE) must stay <= 448); got k = "
+            f"{k_max}. Rescale the KV rows to their natural scale instead of "
+            "e4m3's +-448 range."
+        )
+
+    inv = torch.pow(2.0, -k).unsqueeze(1)
+    scaled = nope * inv
+    idx = (scaled.abs().unsqueeze(-1) - table).abs().argmin(dim=-1).to(torch.uint8)
+    idx = idx | ((scaled.sign() < 0).to(torch.uint8) << 3)  # e2m1 sign is the nibble's MSB
+    kv4 = (idx[:, 0::2] | (idx[:, 1::2] << 4)).to(torch.uint8).contiguous()
+
+    rows = kv.shape[0]
+    kv4_rope = torch.zeros(rows, D_QK - D_V + 16, dtype=torch.uint8, device=kv.device)
+    kv4_rope[:, : D_QK - D_V] = (
+        (rope * inv).to(torch.float8_e4m3fn).view(torch.uint8)
+    )
+    # ue8m0: the stored byte is the biased exponent, k + 127
+    kv4_rope[:, D_QK - D_V] = (k.to(torch.int32) + 127).to(torch.uint8)
+    return kv4, kv4_rope.contiguous()
+
+
+@torch.no_grad()
+def unpack_fp4_pool(kv4: torch.Tensor, kv4_rope: torch.Tensor) -> torch.Tensor:
+    """Expand the fp4 pool back to e4m3 the way the kernel reads it (reference/debug only)."""
+    table = torch.tensor(
+        (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), dtype=torch.float32, device=kv4.device
+    )
+    lo = (kv4 & 0xF).to(torch.long)
+    hi = (kv4 >> 4).to(torch.long)
+
+    def _decode(code: torch.Tensor) -> torch.Tensor:
+        mag = table[(code & 0x7)]
+        return torch.where((code & 0x8) != 0, -mag, mag)
+
+    rt = torch.pow(2.0, kv4_rope[:, D_QK - D_V].to(torch.float32) - 127.0).unsqueeze(1)
+    nope = torch.empty(kv4.shape[0], D_V, dtype=torch.float32, device=kv4.device)
+    nope[:, 0::2] = _decode(lo)
+    nope[:, 1::2] = _decode(hi)
+    nope = nope * rt
+    rope = kv4_rope[:, : D_QK - D_V].view(torch.float8_e4m3fn).to(torch.float32) * rt
+    return torch.cat([nope, rope], dim=1).to(torch.float8_e4m3fn)
 
 
 @cache_once
@@ -150,7 +276,8 @@ def _choose_num_splits(s_q: int, h_q: int, topk: int, num_sms: int) -> int:
 @debug_kernel_api
 def sparse_mla_q8kv8_sm100_fwd(
     q: torch.Tensor,
-    kv: torch.Tensor,
+    kv4: torch.Tensor,
+    kv4_rope: torch.Tensor,
     indices: torch.Tensor,
     bmm1_scale: float,
     bmm2_scale: float = 1.0,
@@ -158,18 +285,26 @@ def sparse_mla_q8kv8_sm100_fwd(
     topk_length: Optional[torch.Tensor] = None,
     num_splits: Optional[int] = None,
     *,
+    pt_eL: float = 0.0,
+    kv4_sf: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     max_logits: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """FP8 sparse MLA on SM100: logits = bmm1_scale * q.k, out = bmm2_scale * softmax(logits) @ v.
+    """sparse MLA on SM100 with an fp4 KV pool (per-row scales).
 
     V is the first 512 dims of each KV row. Indices < 0 or >= s_kv and positions >= topk_length are
     masked. Masked positions with an in-range index still load their row, which must not hold NaN.
 
+    The KV cache is the fp4 pool produced by ``pack_fp4_pool``: packed e2m1 NoPE dims plus pre-scaled
+    e4m3 RoPE dims carrying a per-row ue8m0 exponent, 336 B/row instead of 576. The exponent is applied
+    inside the kernel per token, so callers keep passing the same ``bmm1_scale`` / ``bmm2_scale`` they
+    would for the e4m3 kernel.
+
     Args:
         q:           [s_q, h_q, 576], float8_e4m3fn, NoPE then RoPE dims
-        kv:          [s_kv, 576] or paged [pages, (1,) page_size, 576], float8_e4m3fn
+        kv4:         [s_kv, 256], uint8, packed e2m1 nibbles of the 512 NoPE dims
+        kv4_rope:    [s_kv, 80], uint8, pre-scaled e4m3 RoPE dims with this row's exponent in byte 64
         indices:     [s_q, topk] or [s_q, 1, topk], int32 token rows of kv
         bmm1_scale:  q_scale * kv_scale * sm_scale
         bmm2_scale:  kv_scale of V
@@ -190,27 +325,29 @@ def sparse_mla_q8kv8_sm100_fwd(
         q.dim() == 3 and q.shape[2] == D_QK,
         f"q must be [s_q, h_q, {D_QK}], got {tuple(q.shape)}",
     )
+    _check(q.dtype == torch.float8_e4m3fn, f"q must be float8_e4m3fn, got {q.dtype}")
     _check(
-        q.dtype == torch.float8_e4m3fn and kv.dtype == torch.float8_e4m3fn,
-        "q and kv must be float8_e4m3fn",
+        kv4.dtype == torch.uint8 and kv4_rope.dtype == torch.uint8,
+        f"the fp4 pool must be uint8, got {kv4.dtype} and {kv4_rope.dtype}",
     )
-    _check(kv.shape[-1] == D_QK, f"kv must end in {D_QK} dims, got {tuple(kv.shape)}")
-    if kv.dim() != 2:
-        _check(
-            kv.is_contiguous(),
-            "a paged or 3D kv must be contiguous so its token rows flatten without a copy",
-        )
-        kv = kv.view(-1, D_QK)
+    # [s_kv, 256] packed e2m1 + [s_kv, 80] pre-scaled e4m3 RoPE with the row exponent in byte 64.
+    _check(
+        kv4.shape[-1] == D_V // 2 and kv4_rope.shape[-1] == D_QK - D_V,  # PT step 2: rope rows 64 B
+        f"pool must be [s_kv, {D_V // 2}] + [s_kv, {D_QK - D_V + 16}], "
+        f"got {tuple(kv4.shape)} and {tuple(kv4_rope.shape)}",
+    )
+    _check(kv4.dim() == 2 and kv4_rope.dim() == 2, "the fp4 pool must be 2-D [s_kv, bytes]")
+    _check(kv4.is_contiguous() and kv4_rope.is_contiguous(), "the fp4 pool must be contiguous")
     if indices.dim() == 3:
         _check(indices.shape[1] == 1, "only h_kv == 1 is supported")
         indices = indices.squeeze(1)
     _check(indices.dtype == torch.int32, "indices must be int32")
     s_q, h_q_real, _ = q.shape
-    s_kv, topk = kv.shape[0], indices.shape[1]
+    s_kv, topk = kv4.shape[0], indices.shape[1]
     _check(indices.shape[0] == s_q, "indices must have s_q rows")
     _check(topk % 64 == 0, f"topk must be a multiple of 64, got {topk}")
     device = q.device
-    for name, t in (("q", q), ("kv", kv), ("indices", indices)):
+    for name, t in (("q", q), ("kv4", kv4), ("kv4_rope", kv4_rope), ("indices", indices)):
         _check(t.device == device, f"{name} must be on {device}, got {t.device}")
         _check(t.stride(-1) == 1, f"{name} must be contiguous in its last dimension")
 
@@ -278,9 +415,12 @@ def sparse_mla_q8kv8_sm100_fwd(
         partial_max_logits = _placeholder(device, torch.float32, "partial_max_logits")
         partial_lse = _placeholder(device, torch.float32, "partial_lse")
 
+    _check(kv4_sf is not None and kv4_sf.dtype == torch.uint8 and kv4_sf.numel() == kv4.shape[0], "kv4_sf must be [s_kv] uint8")
     _sparse_mla_q8kv8_sm100_op(
         q,
-        kv,
+        kv4,
+        kv4_rope,
+        kv4_sf.contiguous(),
         indices,
         (
             attn_sink
@@ -305,10 +445,10 @@ def sparse_mla_q8kv8_sm100_fwd(
         num_splits,
         q.stride(0),
         q.stride(1),
-        kv.stride(0),
         indices.stride(0),
         float(bmm1_scale),
         float(bmm2_scale),
+        float(pt_eL),
         int(attn_sink is not None),
         int(topk_length is not None),
     )
@@ -327,11 +467,15 @@ def sparse_mla_q8kv8_sm100_fwd(
 
 def sparse_mla_q8kv8_sm100_trtllm(
     query: torch.Tensor,
-    kv_cache: torch.Tensor,
+    kv4: torch.Tensor,
+    kv4_rope: torch.Tensor,
     block_tables: torch.Tensor,
     bmm1_scale: float,
     bmm2_scale: float = 1.0,
     seq_lens: Optional[torch.Tensor] = None,
+    *,
+    kv4_sf: Optional[torch.Tensor] = None,
+    pt_eL: float = 0.0,
 ) -> torch.Tensor:
     """Same arguments and result as FlashInfer's TRT-LLM-gen sparse MLA call.
 
@@ -341,7 +485,8 @@ def sparse_mla_q8kv8_sm100_trtllm(
 
     Args:
         query:        [batch, q_len, h_q, 576], float8_e4m3fn
-        kv_cache:     [pages, (1,) page_size, 576], float8_e4m3fn
+        kv4:          [s_kv, 256], uint8, packed e2m1 of the 512 NoPE dims
+        kv4_rope:     [s_kv, 80], uint8, pre-scaled e4m3 RoPE + the row exponent
         block_tables: [batch, q_len, topk], int32 token slots
         bmm1_scale:   q_scale * kv_scale * sm_scale
         bmm2_scale:   kv_scale of V
@@ -361,10 +506,78 @@ def sparse_mla_q8kv8_sm100_trtllm(
         topk_length = seq_lens.reshape(batch)
     out, _, _ = sparse_mla_q8kv8_sm100_fwd(
         query.view(batch * q_len, h_q, D_QK),
-        kv_cache,
+        kv4,
+        kv4_rope,
         block_tables.view(batch * q_len, block_tables.shape[-1]),
         bmm1_scale,
         bmm2_scale,
         topk_length=topk_length,
+        pt_eL=pt_eL,
+        kv4_sf=kv4_sf,
     )
     return out.view(batch, q_len, h_q, D_V)
+
+
+
+# ---------------------------------------------------------------------------------------------------------
+# PT pool (patch_pt.py): per-token e4m3 scale on nope only, rope e4m3 without any scale
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+@torch.no_grad()
+def pack_pt_pool(kv: torch.Tensor, rt_max: float = 1.75):
+    """kv [s_kv, 576] float (natural scale) -> (kv4 [s_kv, 256] u8, kv4_rope [s_kv, 80] u8, eL int).
+    r_t = smallest e4m3 >= amax_t / 6 / 2^eL; eL per pool so that max r_t <= rt_max (P r_t <= 448)."""
+    import math
+    _check(kv.dim() == 2 and kv.shape[1] == D_QK, f"kv must be [s_kv, {D_QK}]")
+    dev = kv.device
+    nope = kv[:, :D_V].float()
+    rope = kv[:, D_V:].float()
+    amax = nope.abs().amax(dim=1)
+    want = amax / 6.0
+    wmax = float(want.max())
+    eL = math.ceil(math.log2(wmax / rt_max)) if wmax > 0 else 0
+    while True:
+        w = want / 2.0 ** eL
+        rt = w.to(torch.float8_e4m3fn).float()
+        nxt = (rt.to(torch.float8_e4m3fn).view(torch.uint8) + 1).view(torch.float8_e4m3fn).float()
+        rt = torch.where(rt < w, nxt, rt)
+        if float(rt.max()) <= rt_max:
+            break
+        eL += 1
+    rt = torch.where(amax > 0, rt, torch.full_like(rt, 2.0 ** -9))
+    table = torch.tensor(_E2M1, device=dev)
+    scaled = nope / (rt * 2.0 ** eL).unsqueeze(1)
+    mids = (table[1:] + table[:-1]) / 2
+    mag = torch.bucketize(scaled.abs().clamp(max=6.0), mids).to(torch.uint8)
+    code = mag | ((scaled < 0).to(torch.uint8) << 3)
+    kv4 = (code[:, 0::2] | (code[:, 1::2] << 4)).contiguous()
+    kv4_rope = torch.zeros(kv.shape[0], D_QK - D_V + 16, dtype=torch.uint8, device=dev)
+    kv4_rope[:, : D_QK - D_V] = rope.clamp(-448, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+    kv4_rope[:, D_QK - D_V] = rt.to(torch.float8_e4m3fn).view(torch.uint8)
+    return kv4, kv4_rope.contiguous(), eL
+
+
+@torch.no_grad()
+def unpack_pt_pool(kv4: torch.Tensor, kv4_rope: torch.Tensor, eL: int) -> torch.Tensor:
+    """The exact values the kernel multiplies with, float32 [s_kv, 576]."""
+    table = torch.tensor(_E2M1, device=kv4.device)
+
+    def dec(c):
+        m = table[(c & 7).long()]
+        return torch.where((c & 8) != 0, -m, m)
+
+    rt = kv4_rope[:, D_QK - D_V].view(torch.float8_e4m3fn).float() * 2.0 ** eL
+    nope = torch.empty(kv4.shape[0], D_V, device=kv4.device)
+    nope[:, 0::2] = dec(kv4 & 0xF)
+    nope[:, 1::2] = dec(kv4 >> 4)
+    rope = kv4_rope[:, : D_QK - D_V].view(torch.float8_e4m3fn).float()
+    return torch.cat([nope * rt.unsqueeze(1), rope], dim=1)
+
+
+
+@torch.no_grad()
+def pack_pt_pool_ldg(kv: torch.Tensor, rt_max: float = 1.75):
+    """PT step 2 pool: (kv4 [s_kv, 256], kv4_rope [s_kv, 64], kv4_sf [s_kv], eL) = 321 B/row."""
+    kv4, kv4_rope80, eL = pack_pt_pool(kv, rt_max)
+    return kv4, kv4_rope80[:, : D_QK - D_V].contiguous(), kv4_rope80[:, D_QK - D_V].contiguous(), eL
